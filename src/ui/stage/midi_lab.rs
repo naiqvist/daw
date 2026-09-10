@@ -661,6 +661,10 @@ pub(super) fn progression_text(recipe: &Recipe) -> String {
 #[derive(Clone, Debug)]
 pub(super) struct MidiLab {
     pub composer: super::composer::State,
+    /// The guided ladder, when this window is on it. `None` is the full
+    /// inspector — the ladder is a front door, not a mode the lab is
+    /// trapped in.
+    pub ladder: Option<super::midi_ladder::Ladder>,
     pub draft: u64,
     pub address: String,
     pub progression: String,
@@ -683,7 +687,7 @@ pub(super) struct MidiLab {
     pub job: Option<Arc<midi_lab::audition::Job>>,
     pub submitted: Option<Recipe>,
     pub played: Option<std::time::Instant>,
-    pub preview_seconds:f64,
+    pub preview_seconds: f64,
     pub clip_preview: bool,
     pub stop: bool,
 }
@@ -692,7 +696,9 @@ impl PartialEq for MidiLab {
         self.draft == other.draft
             && self.address == other.address
             // The cursor is part of what a key press is allowed to change:
-            // moving it and changing nothing else is still a change.
+            // moving it and changing nothing else is still a change. The
+            // ladder's own place is a cursor for the same reason.
+            && self.ladder == other.ladder
             && self.row == other.row
             && self.column == other.column
             && self.chord == other.chord
@@ -708,6 +714,9 @@ impl MidiLab {
         );
         Self {
             composer: super::composer::State::default(),
+            // A new lab opens on the ladder: the first question it asks
+            // is the one that used to be a typed tag.
+            ladder: Some(super::midi_ladder::Ladder::default()),
             draft,
             address,
             progression: "Cmaj7:4 Am7:2 Dm7:1 G7:1".into(),
@@ -725,7 +734,7 @@ impl MidiLab {
             job: None,
             submitted: None,
             played: None,
-            preview_seconds:0.,
+            preview_seconds: 0.,
             clip_preview: false,
             stop: false,
         }
@@ -743,6 +752,29 @@ impl Stage {
     /// Deterministic states for the native screenshot harness.
     #[doc(hidden)]
     pub fn pose_midi_lab(&mut self, pose: &str) {
+        // A pose on the ladder: `stage-midi-ladder-chords`, and so on.
+        if pose.contains("ladder") {
+            self.open_midi_lab("");
+            let rung = if pose.contains("chords") {
+                super::midi_ladder::Rung::Chords
+            } else if pose.contains("parts") {
+                super::midi_ladder::Rung::Parts
+            } else if pose.contains("feel") {
+                super::midi_ladder::Rung::Feel
+            } else if pose.contains("listen") {
+                super::midi_ladder::Rung::Listen
+            } else {
+                super::midi_ladder::Rung::Clip
+            };
+            if let Some(window) = self.midi_window_mut(0) {
+                window.ladder = Some(super::midi_ladder::Ladder {
+                    rung,
+                    at: 0,
+                    tonic: 0,
+                });
+            }
+            return;
+        }
         use super::composer::{self as controller, Subject};
         use midi_lab::composer::*;
         self.open_midi_lab("");
@@ -926,7 +958,7 @@ impl Stage {
         Ok(())
     }
     /// The focused MIDI Lab window and the draft it edits.
-    fn midi_focus(&self) -> Option<(usize, u64)> {
+    pub(super) fn midi_focus(&self) -> Option<(usize, u64)> {
         let window = self.lab.focus?;
         match &self.lab.window(window)?.instrument {
             Instrument::Midi(m) => Some((window, m.draft)),
@@ -934,21 +966,21 @@ impl Stage {
         }
     }
 
-    fn midi_window(&self, window: usize) -> Option<&MidiLab> {
+    pub(super) fn midi_window(&self, window: usize) -> Option<&MidiLab> {
         match &self.lab.window(window)?.instrument {
             Instrument::Midi(m) => Some(m),
             _ => None,
         }
     }
 
-    fn midi_window_mut(&mut self, window: usize) -> Option<&mut MidiLab> {
+    pub(super) fn midi_window_mut(&mut self, window: usize) -> Option<&mut MidiLab> {
         match &mut self.lab.window_mut(window)?.instrument {
             Instrument::Midi(m) => Some(m),
             _ => None,
         }
     }
 
-    fn midi_recipe(&self, draft: u64) -> Option<&Recipe> {
+    pub(super) fn midi_recipe(&self, draft: u64) -> Option<&Recipe> {
         self.song
             .midi_labs
             .iter()
@@ -991,7 +1023,9 @@ impl Stage {
     /// getting about, which is what the pointer had and the keyboard did
     /// not; shift turns whatever the cursor has reached.
     pub(super) fn midi_move(&mut self, step: Step) -> Result<(), super::RefusalReason> {
-        if self.has_composer() { return self.composer_key(Some(step), false, false); }
+        if self.has_composer() {
+            return self.composer_key(Some(step), false, false);
+        }
         use super::RefusalReason as R;
         let (window, draft) = self.midi_focus().ok_or(R::Empty)?;
         let rows = {
@@ -1052,7 +1086,9 @@ impl Stage {
     /// Tab: the next row of the page, which is how a hand crosses it in
     /// one key rather than five.
     pub(super) fn midi_group(&mut self) -> Result<(), super::RefusalReason> {
-        if self.has_composer() { return self.composer_key(Some(Step::Down), false, false); }
+        if self.has_composer() {
+            return self.composer_key(Some(Step::Down), false, false);
+        }
         use super::RefusalReason as R;
         let (window, draft) = self.midi_focus().ok_or(R::Empty)?;
         let rows = {
@@ -1073,7 +1109,9 @@ impl Stage {
 
     /// Enter: do the obvious thing where the cursor stands.
     pub(super) fn midi_enter(&mut self) -> Result<(), super::RefusalReason> {
-        if self.has_composer() { return self.composer_key(None, false, true); }
+        if self.has_composer() {
+            return self.composer_key(None, false, true);
+        }
         use super::RefusalReason as R;
         let (window, draft) = self.midi_focus().ok_or(R::Empty)?;
         let field = {
@@ -1172,7 +1210,9 @@ impl Stage {
     /// Shift and an arrow: change the control under the cursor. Right and
     /// Up raise it, Left and Down lower it; the vertical pair moves by more.
     pub(super) fn midi_shift(&mut self, step: Step) -> Result<(), super::RefusalReason> {
-        if self.has_composer() { return self.composer_key(Some(step), true, false); }
+        if self.has_composer() {
+            return self.composer_key(Some(step), true, false);
+        }
         let (window, draft) = self.midi_focus().ok_or(super::RefusalReason::Empty)?;
         let up = matches!(step, Step::Right | Step::Up);
         let coarse = matches!(step, Step::Up | Step::Down);
@@ -1435,19 +1475,44 @@ impl Stage {
         if let Some(composition) = &draft.recipe.composition {
             let rendered = midi_lab::composer::render(composition)?;
             let mut recipe = draft.recipe.clone();
-            let c = recipe.composition.as_mut().ok_or("Composition disappeared")?;
+            let c = recipe
+                .composition
+                .as_mut()
+                .ok_or("Composition disappeared")?;
             c.snapshot = Some(midi_lab::composer::Snapshot {
-                harmony:rendered.harmony.clone(),voicings:rendered.voicings.clone(),
+                harmony: rendered.harmony.clone(),
+                voicings: rendered.voicings.clone(),
                 length: rendered.length,
-                input: c.input()?, events: rendered.notes.clone(), label: c.name.clone(),
+                input: c.input()?,
+                events: rendered.notes.clone(),
+                label: c.name.clone(),
             });
             let mut song = self.song.clone();
             let delivered = midi_lab::composer::output::apply(&mut song, &recipe, dest, &rendered)?;
-            if let Some(d) = song.midi_labs.iter_mut().find(|d| d.id == id) { d.recipe = recipe; }
-            self.settle(); self.song = song; self.touched(); self.settle();
-            let count=delivered.iter().map(|d|d.events.len()).sum::<usize>();
-            let changes=delivered.iter().flat_map(|d|d.changes.iter()).cloned().collect::<Vec<_>>().join(" · ");
-            return Ok(format!("Sent {count} notes across {} clips · {} beats{}",delivered.len(),f64::from(rendered.length)/48.,if changes.is_empty(){String::new()}else{format!(" · {changes}")}));
+            if let Some(d) = song.midi_labs.iter_mut().find(|d| d.id == id) {
+                d.recipe = recipe;
+            }
+            self.settle();
+            self.song = song;
+            self.touched();
+            self.settle();
+            let count = delivered.iter().map(|d| d.events.len()).sum::<usize>();
+            let changes = delivered
+                .iter()
+                .flat_map(|d| d.changes.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            return Ok(format!(
+                "Sent {count} notes across {} clips · {} beats{}",
+                delivered.len(),
+                f64::from(rendered.length) / 48.,
+                if changes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {changes}")
+                }
+            ));
         }
         if !self.song.tracks.iter().any(|t| t.id == dest.track) {
             return Err("Destination track was removed".into());
@@ -1492,12 +1557,25 @@ impl Stage {
         }
         let mut recipe = draft.recipe.clone();
         if chord_only && let Some(composition) = &mut recipe.composition {
-            let mut h = composition.harmony.get(m.composer.chord).ok_or("Select a chord")?.clone();
-            h.start = 0; h.length = 96;
-            composition.harmony = vec![h]; composition.length = 96;
-            composition.form.clear(); composition.sections.clear(); composition.placements.clear();
-            composition.overrides.clear(); composition.frozen = false; composition.modulations.clear();
-            for (i,v) in composition.voices.iter_mut().enumerate() { v.enabled=i==0; v.rhythm.kind=midi_lab::composer::RhythmKind::Hold; }
+            let mut h = composition
+                .harmony
+                .get(m.composer.chord)
+                .ok_or("Select a chord")?
+                .clone();
+            h.start = 0;
+            h.length = 96;
+            composition.harmony = vec![h];
+            composition.length = 96;
+            composition.form.clear();
+            composition.sections.clear();
+            composition.placements.clear();
+            composition.overrides.clear();
+            composition.frozen = false;
+            composition.modulations.clear();
+            for (i, v) in composition.voices.iter_mut().enumerate() {
+                v.enabled = i == 0;
+                v.rhythm.kind = midi_lab::composer::RhythmKind::Hold;
+            }
         } else if chord_only {
             let mut h = recipe.harmony.get(m.chord).ok_or("Select a chord")?.clone();
             h.start = 0;
@@ -1557,7 +1635,7 @@ impl Stage {
             m.job = None;
             match result {
                 Ok(audio) => {
-                    m.preview_seconds=audio.frames as f64/f64::from(audio.rate);
+                    m.preview_seconds = audio.frames as f64 / f64::from(audio.rate);
                     m.status = "Playing the current MIDI through destination instrument".into();
                     m.played = if m.clip_preview {
                         Some(std::time::Instant::now())

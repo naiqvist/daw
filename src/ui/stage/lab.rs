@@ -466,6 +466,45 @@ impl Kiln {
     }
 }
 
+/// One kind of EXTENSION a lab window can hold.
+///
+/// The lab is a tiler of extensions, and this table is what they are:
+/// a word, a line about it, and how one opens. The kiln and the MIDI
+/// lab are two entries rather than two special cases, so a third is a
+/// row here and nothing else — and the menu that offers them is the one
+/// door all of them come through.
+#[derive(Clone, Copy)]
+pub(super) struct ExtensionKind {
+    pub word: &'static str,
+    /// What it is for, in a line. The menu reads this out.
+    pub note: &'static str,
+    /// How one arrives. Not a value to construct: the MIDI lab has to
+    /// find or make its draft in the song first, and an extension knows
+    /// how to open itself.
+    pub open: fn(&mut Stage) -> Result<(), RefusalReason>,
+}
+
+pub(super) const EXTENSIONS: &[ExtensionKind] = &[
+    ExtensionKind {
+        word: "KILN",
+        note: "bake a deep instrument: engines, macros, a hundred sliders",
+        open: |stage| {
+            let id = stage.lab.open_window(Instrument::Kiln(Kiln::default()));
+            stage.lab.fullscreen = false;
+            stage.notice = Some(format!("kiln {}", id + 1));
+            Ok(())
+        },
+    },
+    ExtensionKind {
+        word: "MIDI LAB",
+        note: "compose a pattern: harmony, motif and drums against a clip",
+        open: |stage| {
+            stage.open_midi_lab("");
+            Ok(())
+        },
+    },
+];
+
 /// What a lab window holds.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Instrument {
@@ -501,6 +540,9 @@ pub(super) struct Lab {
     pub layout: Layout,
     pub windows: Vec<LabWindow>,
     pub focus: Option<WindowId>,
+    /// The extension menu, and the row it is on. Open, it owns the
+    /// keys — the window underneath must not answer them.
+    pub menu: Option<usize>,
     next_id: WindowId,
 }
 
@@ -578,7 +620,9 @@ impl Stage {
         self.matrix.open = false;
         self.lab.open = true;
         if self.lab.windows.is_empty() {
-            self.lab.open_window(Instrument::Kiln(Kiln::default()));
+            // The lab opens with the first kind in it; Alt+Enter is
+            // where any other one comes from.
+            let _ = self.lab_open_window();
         }
         self.lab.inside = self.lab.focus.is_some();
         self.notice = Some("lab".to_owned());
@@ -625,17 +669,75 @@ impl Stage {
             return Err(RefusalReason::Empty);
         }
         if self.lab.focus.is_none() {
-            self.lab.open_window(Instrument::Kiln(Kiln::default()));
+            // An empty lab opens the first kind rather than asking: the
+            // menu is for choosing, and there is nothing here to choose
+            // between yet.
+            let _ = self.lab_open_window();
         }
         self.lab.inside = true;
         Ok(())
     }
 
-    /// Alt+Enter: a new kiln beside the focused window.
+    /// The kiln, opened the way the menu opens it. Kept as a verb of its
+    /// own because the empty lab still wants one on Enter.
     pub(super) fn lab_open_window(&mut self) -> Result<(), RefusalReason> {
-        let id = self.lab.open_window(Instrument::Kiln(Kiln::default()));
-        self.lab.fullscreen = false;
-        self.notice = Some(format!("kiln {}", id + 1));
+        match EXTENSIONS.first() {
+            Some(kind) => (kind.open)(self),
+            None => Err(RefusalReason::Empty),
+        }
+    }
+
+    /// Alt+Enter: the menu of extensions, over whatever is there.
+    pub(super) fn lab_menu_open(&mut self) -> Result<(), RefusalReason> {
+        if self.lab.menu.is_some() {
+            self.lab.menu = None;
+            return Ok(());
+        }
+        self.lab.menu = Some(0);
+        Ok(())
+    }
+
+    /// Up and down the menu, wrapping: a list this short should not have
+    /// an edge to hit.
+    pub(super) fn lab_menu_step(&mut self, step: Step) -> Result<(), RefusalReason> {
+        let at = self.lab.menu.ok_or(RefusalReason::Empty)?;
+        let count = EXTENSIONS.len().max(1);
+        let next = match step {
+            Step::Up | Step::Left => (at + count - 1) % count,
+            Step::Down | Step::Right => (at + 1) % count,
+        };
+        self.lab.menu = Some(next);
+        Ok(())
+    }
+
+    /// Enter, or the extension's own number: open it and close the menu.
+    pub(super) fn lab_menu_pick(&mut self, at: usize) -> Result<(), RefusalReason> {
+        let kind = EXTENSIONS.get(at).ok_or(RefusalReason::Empty)?;
+        self.lab.menu = None;
+        (kind.open)(self)
+    }
+
+    /// Escape: the menu goes, and nothing was opened.
+    pub(super) fn lab_menu_close(&mut self) -> bool {
+        self.lab.menu.take().is_some()
+    }
+
+    /// Alt and a number: the nth window takes the keys, whichever
+    /// extension it holds. A tiler needs somewhere to jump to.
+    pub(super) fn lab_focus_nth(&mut self, at: usize) -> Result<(), RefusalReason> {
+        let ids = self.lab.layout.window_ids();
+        let id = ids.get(at).copied().ok_or(RefusalReason::Empty)?;
+        if self.lab.focus == Some(id) {
+            // Already there: a refusal, not a change with nothing behind
+            // it. The keys that move must be honest about not moving.
+            return Err(RefusalReason::Empty);
+        }
+        self.lab.focus = Some(id);
+        let word = self
+            .lab
+            .window(id)
+            .map_or("", |window| window.instrument.name());
+        self.notice = Some(format!("{word} {}", at + 1));
         Ok(())
     }
 
@@ -990,10 +1092,120 @@ mod tests {
         assert!(stage.lab.open);
     }
 
+    /// The menu is the one door every extension comes through: Alt+Enter
+    /// offers the kinds, a number or Enter opens one, Escape opens
+    /// nothing. While it stands it owns the keys, so the window under it
+    /// cannot answer them.
+    #[test]
+    fn the_extension_menu_offers_every_kind_and_opens_one() {
+        let mut stage = lab();
+        let before = stage.lab.windows.len();
+        assert_eq!(alt(&mut stage, Key::Enter), Some(ApplyOutcome::Changed));
+        assert_eq!(stage.lab.menu, Some(0));
+        assert_eq!(stage.scope_context(), ScopeContext::LabMenu);
+        assert_eq!(stage.lab.windows.len(), before, "the menu opened a window");
+
+        // Down and up walk it, and it wraps at both ends.
+        let _ = stage.handle_key(Mods::NONE, Key::ArrowDown);
+        assert_eq!(stage.lab.menu, Some(1));
+        for _ in 1..EXTENSIONS.len() {
+            let _ = stage.handle_key(Mods::NONE, Key::ArrowDown);
+        }
+        assert_eq!(stage.lab.menu, Some(0), "the menu did not wrap");
+        let _ = stage.handle_key(Mods::NONE, Key::ArrowUp);
+        assert_eq!(stage.lab.menu, Some(EXTENSIONS.len() - 1));
+
+        // Escape puts it away and opens nothing.
+        let _ = stage.handle_key(Mods::NONE, Key::Escape);
+        assert_eq!(stage.lab.menu, None);
+        assert_eq!(stage.lab.windows.len(), before);
+        assert!(stage.lab.open, "escaping the menu left the lab");
+
+        // Enter opens the kind under the cursor.
+        let _ = alt(&mut stage, Key::Enter);
+        let _ = stage.handle_key(Mods::NONE, Key::Enter);
+        assert_eq!(stage.lab.menu, None);
+        assert_eq!(stage.lab.windows.len(), before + 1);
+        assert!(matches!(
+            stage.lab.focused().map(|w| &w.instrument),
+            Some(Instrument::Kiln(_))
+        ));
+    }
+
+    /// Every kind in the table opens something, and what it opens is the
+    /// kind it named. A row that cannot open is a menu entry that lies.
+    #[test]
+    fn every_extension_in_the_table_opens_its_own_kind() {
+        for (at, kind) in EXTENSIONS.iter().enumerate() {
+            let mut stage = lab();
+            let before = stage.lab.windows.len();
+            let _ = alt(&mut stage, Key::Enter);
+            // The number picks it outright, without walking.
+            let digit = [Key::Num1, Key::Num2, Key::Num3, Key::Num4][at.min(3)];
+            let outcome = stage.handle_key(Mods::NONE, digit);
+            assert_eq!(
+                outcome,
+                Some(ApplyOutcome::Changed),
+                "{} did not open",
+                kind.word
+            );
+            assert_eq!(stage.lab.menu, None, "{} left the menu up", kind.word);
+            assert!(
+                stage.lab.windows.len() > before
+                    || stage
+                        .lab
+                        .focused()
+                        .is_some_and(|w| w.instrument.name() == kind.word),
+                "{} opened no window of its own",
+                kind.word
+            );
+            if let Some(window) = stage.lab.focused() {
+                assert_eq!(
+                    window.instrument.name(),
+                    kind.word,
+                    "{} opened a {}",
+                    kind.word,
+                    window.instrument.name()
+                );
+            }
+        }
+    }
+
+    /// Alt and a number goes straight to a window, whatever it holds.
+    #[test]
+    fn a_number_reaches_the_nth_window() {
+        let mut stage = lab();
+        let _ = alt(&mut stage, Key::Enter);
+        let _ = stage.handle_key(Mods::NONE, Key::Enter);
+        assert_eq!(stage.lab.windows.len(), 2);
+        assert_eq!(stage.lab.focus, Some(1));
+        assert_eq!(
+            stage.handle_key(Mods::ALT, Key::Num1),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.lab.focus, Some(0));
+        assert_eq!(
+            stage.handle_key(Mods::ALT, Key::Num2),
+            Some(ApplyOutcome::Changed)
+        );
+        assert_eq!(stage.lab.focus, Some(1));
+        // A number with no window under it refuses rather than moving.
+        assert!(matches!(
+            stage.handle_key(Mods::ALT, Key::Num8),
+            Some(ApplyOutcome::Refused(_))
+        ));
+        assert_eq!(stage.lab.focus, Some(1));
+    }
+
     #[test]
     fn the_tiler_opens_focuses_swaps_and_closes_windows() {
         let mut stage = lab();
         assert_eq!(alt(&mut stage, Key::Enter), Some(ApplyOutcome::Changed));
+        // The menu, then the kiln it offers first.
+        assert_eq!(
+            stage.handle_key(Mods::NONE, Key::Enter),
+            Some(ApplyOutcome::Changed)
+        );
         assert_eq!(stage.lab.windows.len(), 2);
         assert_eq!(stage.lab.focus, Some(1));
         assert_eq!(alt(&mut stage, Key::H), Some(ApplyOutcome::Changed));

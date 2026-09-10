@@ -35,6 +35,7 @@ mod kiln;
 mod lab;
 mod matrix;
 mod midi_lab;
+mod midi_ladder;
 mod mixer;
 mod modulation;
 mod plock_editor;
@@ -2244,6 +2245,8 @@ impl Stage {
             keymap::ScopeContext::Browser
         } else if self.chain.is_some() {
             keymap::ScopeContext::Chain
+        } else if self.lab.open && self.lab.menu.is_some() {
+            keymap::ScopeContext::LabMenu
         } else if self.lab.open {
             match self.lab.focused() {
                 Some(window) if self.lab.inside => match &window.instrument {
@@ -4512,6 +4515,45 @@ impl Stage {
             return ApplyOutcome::Refused(refusal);
         }
         let result = match intent {
+            // The ladder owns the keys while it is up: the arrows walk
+            // its rows and turn their values, Enter takes the row, Tab
+            // climbs a rung, Escape goes back down one.
+            StageIntent::MidiLadder => self.ladder_toggle(),
+            StageIntent::Step(step) if self.midi_ladder().is_some() => match step {
+                Step::Up | Step::Down => self.ladder_move(step),
+                Step::Left => self.ladder_turn(-1),
+                Step::Right => self.ladder_turn(1),
+            },
+            StageIntent::Enter if self.midi_ladder().is_some() => self.ladder_enter(),
+            StageIntent::MidiLabGroup if self.midi_ladder().is_some() => self.ladder_rung(true),
+            StageIntent::MidiLabShift(step) if self.midi_ladder().is_some() => {
+                self.ladder_rung(step == Step::Right)
+            }
+            StageIntent::Escape
+                if self
+                    .midi_ladder()
+                    .is_some_and(|ladder| ladder.rung != midi_ladder::Rung::Clip) =>
+            {
+                self.ladder_rung(false)
+            }
+            // The extension menu is a LAYER over the lab: while it
+            // stands it answers first — before the deck's cells, which
+            // otherwise take the digits — and Escape puts it away before
+            // the lab's own Escape leaves.
+            StageIntent::Escape if self.lab.menu.is_some() => {
+                self.lab_menu_close();
+                Ok(())
+            }
+            StageIntent::Step(step) if self.lab.menu.is_some() => self.lab_menu_step(step),
+            StageIntent::Enter if self.lab.menu.is_some() => {
+                let at = self.lab.menu.unwrap_or(0);
+                self.lab_menu_pick(at)
+            }
+            StageIntent::Slot(slot) if self.lab.menu.is_some() => {
+                self.lab_menu_pick(usize::from(slot))
+            }
+            // Alt and a number, with the lab up: straight to that window.
+            StageIntent::Slot(slot) if self.lab.open => self.lab_focus_nth(usize::from(slot)),
             StageIntent::Page(key) => self.page(key, false),
             StageIntent::PageBack(key) => self.page(key, true),
             StageIntent::Slot(slot) => {
@@ -4544,7 +4586,7 @@ impl Stage {
             StageIntent::MatrixLay { over } => self.matrix_lay(over),
             StageIntent::MatrixHead => self.matrix_head(),
             StageIntent::Lab => self.toggle_lab(),
-            StageIntent::LabWindow => self.lab_open_window(),
+            StageIntent::LabWindow => self.lab_menu_open(),
             StageIntent::LabClose => self.lab_close_window(),
             StageIntent::LabFocus(step) => self.lab_focus(step),
             StageIntent::LabSwap(step) => self.lab_swap(step),
@@ -9049,6 +9091,10 @@ mod tests {
                         let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
                         let _ = stage.handle_key(Mods::NONE, Key::Slash);
                     }
+                    keymap::ScopeContext::LabMenu => {
+                        let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
+                        let _ = stage.handle_key(Mods::ALT, Key::Enter);
+                    }
                     keymap::ScopeContext::Root => {}
                 }
                 // Everything a key is allowed to change. A new piece of
@@ -9259,6 +9305,10 @@ mod tests {
                 keymap::ScopeContext::KilnFilter => {
                     let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
                     let _ = stage.handle_key(Mods::NONE, Key::Slash);
+                }
+                keymap::ScopeContext::LabMenu => {
+                    let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
+                    let _ = stage.handle_key(Mods::ALT, Key::Enter);
                 }
                 keymap::ScopeContext::Root => {}
                 keymap::ScopeContext::Rename => unreachable!(),
@@ -10439,6 +10489,10 @@ mod tests {
                 keymap::ScopeContext::KilnFilter => {
                     let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
                     let _ = stage.handle_key(Mods::NONE, Key::Slash);
+                }
+                keymap::ScopeContext::LabMenu => {
+                    let _ = stage.handle_key(Mods::COMMAND.plus(Mods::SHIFT), Key::L);
+                    let _ = stage.handle_key(Mods::ALT, Key::Enter);
                 }
                 keymap::ScopeContext::Root => {}
                 keymap::ScopeContext::Nested => {

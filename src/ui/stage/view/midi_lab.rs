@@ -14,10 +14,36 @@ use eframe::egui::{self, Align2, FontId, Rect, Stroke, pos2, vec2};
 
 impl Stage {
     pub(super) fn draw_midi_lab(&mut self, parent: &mut egui::Ui, rect: Rect, window: usize) {
-        let composed = self.lab.window(window).and_then(|w| {
-            if let Instrument::Midi(m) = &w.instrument { self.song.midi_labs.iter().find(|d|d.id==m.draft) } else { None }
-        }).is_some_and(|d|d.recipe.composition.is_some());
-        if composed { self.draw_composer(parent, rect, window); return; }
+        // The ladder takes the window when this lab is on it: one
+        // question at a time, over the same composition the inspector
+        // edits. `A` is the door between them.
+        let ladder = self.lab.window(window).and_then(|w| {
+            if let Instrument::Midi(m) = &w.instrument {
+                m.ladder
+            } else {
+                None
+            }
+        });
+        if let Some(ladder) = ladder {
+            let painter = parent.painter().clone();
+            self.draw_midi_ladder(parent, &painter, rect, ladder);
+            return;
+        }
+        let composed = self
+            .lab
+            .window(window)
+            .and_then(|w| {
+                if let Instrument::Midi(m) = &w.instrument {
+                    self.song.midi_labs.iter().find(|d| d.id == m.draft)
+                } else {
+                    None
+                }
+            })
+            .is_some_and(|d| d.recipe.composition.is_some());
+        if composed {
+            self.draw_composer(parent, rect, window);
+            return;
+        }
         if parent.rect_contains_pointer(rect) && parent.input(|i| i.pointer.any_pressed()) {
             self.lab.focus = Some(window);
             self.lab.inside = true;
@@ -65,7 +91,16 @@ impl Stage {
                     .size(18.)
                     .color(c.bright),
             );
-            if ui.button("Composer").clicked(){match crate::midi_lab::composer::bridge::migrate(&draft.recipe){Ok(c)=>{draft.recipe.composition=Some(Box::new(c));state.cancel();state.status="Legacy notes preserved in a versioned composition".into();},Err(e)=>state.status=e}}
+            if ui.button("Composer").clicked() {
+                match crate::midi_lab::composer::bridge::migrate(&draft.recipe) {
+                    Ok(c) => {
+                        draft.recipe.composition = Some(Box::new(c));
+                        state.cancel();
+                        state.status = "Legacy notes preserved in a versioned composition".into();
+                    }
+                    Err(e) => state.status = e,
+                }
+            }
             ui.separator();
             ui.label("Clip");
             let response = ui.add(

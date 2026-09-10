@@ -689,6 +689,9 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             let _ = stage.apply(StageIntent::LabWindow);
             let _ = stage.apply(StageIntent::LabFocus(Step::Left));
         }
+        if which.contains("menu") {
+            let _ = stage.apply(StageIntent::LabWindow);
+        }
         if which.contains("sliders") {
             let _ = stage.apply(StageIntent::KilnBand);
         }

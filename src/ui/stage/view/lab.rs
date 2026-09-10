@@ -4,6 +4,7 @@
 
 use super::{Stage, palette};
 use crate::PROFONT;
+use crate::ui::affordance::{Afford, Affords};
 use crate::ui::chrome;
 use crate::ui::stage::lab::{Band, ENGINES, Instrument, MEMBRANE_MACROS, MEMBRANE_SLIDERS, Place};
 use eframe::egui;
@@ -47,7 +48,7 @@ impl Stage {
             painter.text(
                 inner.center(),
                 egui::Align2::CENTER_CENTER,
-                "LAB · Enter or Alt+Enter opens a kiln · Escape leaves",
+                "LAB · Alt+Enter chooses an extension · Escape leaves",
                 font,
                 c.dim,
             );
@@ -102,17 +103,108 @@ impl Stage {
                 [title.left_bottom(), title.right_bottom()],
                 egui::Stroke::new(1.0, c.rule),
             );
+            // One door for every kind, under the pointer as well: the
+            // menu, not a button per extension.
             let add = egui::Rect::from_min_size(
                 egui::pos2(title.right() - 238., title.top() + 1.),
                 egui::vec2(100., 18.),
             );
-            if ui.put(add, egui::Button::new("+ MIDI Lab")).clicked() {
-                self.open_midi_lab("");
+            if ui.put(add, egui::Button::new("+ extension")).clicked() {
+                let _ = self.lab_menu_open();
             }
             let body = egui::Rect::from_min_max(title.left_bottom(), rect.max);
             match &window.instrument {
                 Instrument::Kiln(kiln) => self.draw_kiln(painter, body, kiln, lit, id),
                 Instrument::Midi(_) => self.draw_midi_lab(ui, body, id),
+            }
+        }
+        self.draw_lab_menu(ui, painter, inner);
+    }
+
+    /// The menu of EXTENSIONS: what a window can hold, as a list. It
+    /// stands over the tiler and owns the keys while it is up, so the
+    /// window underneath is drawn but does not answer.
+    fn draw_lab_menu(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, field: egui::Rect) {
+        let Some(at) = self.lab.menu else {
+            return;
+        };
+        let c = palette::colours();
+        let font = egui::FontId::new(11.0, egui::FontFamily::Name(PROFONT.into()));
+        let small = egui::FontId::new(9.0, egui::FontFamily::Name(PROFONT.into()));
+        let row_h = 30.0;
+        let width = 420.0f32.min(field.width() - 24.0);
+        let height = row_h * crate::ui::stage::lab::EXTENSIONS.len() as f32 + 52.0;
+        let rect = egui::Rect::from_center_size(field.center(), egui::vec2(width, height));
+        painter.rect_filled(rect, 0.0, c.ground);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.5, c.bright),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(rect.left() + PAD, rect.top() + 12.0),
+            egui::Align2::LEFT_CENTER,
+            "EXTENSIONS",
+            font.clone(),
+            c.label,
+        );
+        painter.text(
+            egui::pos2(rect.right() - PAD, rect.top() + 12.0),
+            egui::Align2::RIGHT_CENTER,
+            "Enter opens · Escape leaves",
+            small.clone(),
+            c.dim,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.top() + 24.0),
+                egui::pos2(rect.right(), rect.top() + 24.0),
+            ],
+            egui::Stroke::new(1.0, c.rule),
+        );
+        for (index, kind) in crate::ui::stage::lab::EXTENSIONS.iter().enumerate() {
+            let row = egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.top() + 28.0 + index as f32 * row_h),
+                egui::vec2(rect.width(), row_h),
+            );
+            let chosen = index == at;
+            if chosen {
+                painter.rect_filled(row, 0.0, c.bright.linear_multiply(0.16));
+                crate::ui::nav_cursor::claim(
+                    painter,
+                    ("lab-extension", index),
+                    row,
+                    crate::ui::nav_cursor::Kind::Row,
+                    crate::ui::nav_cursor::Layer::Overlay,
+                    c.bright,
+                );
+            }
+            painter.text(
+                egui::pos2(row.left() + PAD, row.top() + 9.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{}  {}", index + 1, kind.word),
+                font.clone(),
+                if chosen { c.bright } else { c.fg },
+            );
+            painter.text(
+                egui::pos2(row.left() + PAD, row.top() + 22.0),
+                egui::Align2::LEFT_CENTER,
+                kind.note,
+                small.clone(),
+                c.dim,
+            );
+            // The pointer picks a row the same way the number does.
+            if ui
+                .interact(
+                    row,
+                    egui::Id::new(("lab-extension", index)),
+                    egui::Sense::click(),
+                )
+                .affords(Affords::Press)
+                .clicked()
+            {
+                let _ = self.lab_menu_pick(index);
             }
         }
     }

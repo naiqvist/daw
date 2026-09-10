@@ -86,10 +86,16 @@ pub(super) enum ScopeContext {
     /// Escape closes it, Enter keeps the query.
     KilnFilter,
     MidiLab,
+    /// The menu of EXTENSIONS is up over the lab: the list of kinds a
+    /// window can hold. Up and down walk it, a number picks one
+    /// outright, Enter opens the one under the cursor and Escape puts
+    /// the menu away without opening anything. It owns the keys while
+    /// it stands, so the window underneath cannot answer them.
+    LabMenu,
 }
 
 impl ScopeContext {
-    pub(super) const ALL: [Self; 20] = [
+    pub(super) const ALL: [Self; 21] = [
         Self::Root,
         Self::Nested,
         Self::Browser,
@@ -110,6 +116,7 @@ impl ScopeContext {
         Self::Kiln,
         Self::KilnFilter,
         Self::MidiLab,
+        Self::LabMenu,
     ];
 }
 
@@ -174,6 +181,9 @@ pub enum StageIntent {
     LabResize(Step),
     /// Alt+T: the split holding the focused window turns the other way.
     LabSplit,
+    /// `A` in a MIDI Lab: the guided ladder, or the full inspector. Both
+    /// drive the same composition, so the key is a door and not a mode.
+    MidiLadder,
     /// Alt+Space: the next window.
     LabCycle,
     /// Tab in a kiln: the next band (engine, macros, sliders).
@@ -705,6 +715,7 @@ impl StageIntent {
             Self::LabResize(Step::Right) => "grow window",
             Self::LabResize(_) => "shrink window",
             Self::LabSplit => "turn the split",
+            Self::MidiLadder => "ladder or inspector",
             Self::LabCycle => "next lab window",
             Self::KilnBand => "next band",
             Self::KilnMacro(_) => "pick macro",
@@ -2350,7 +2361,11 @@ pub(super) fn bindings_for(scope: ScopeContext) -> std::vec::IntoIter<(Mods, Key
     }
     if matches!(
         scope,
-        ScopeContext::Lab | ScopeContext::Kiln | ScopeContext::KilnFilter | ScopeContext::MidiLab
+        ScopeContext::Lab
+            | ScopeContext::Kiln
+            | ScopeContext::KilnFilter
+            | ScopeContext::MidiLab
+            | ScopeContext::LabMenu
     ) {
         return lab_bindings(scope).into_iter();
     }
@@ -2484,6 +2499,11 @@ fn lab_bindings(scope: ScopeContext) -> Vec<(Mods, Key, StageIntent)> {
         (Mods::ALT, Key::T, StageIntent::LabSplit),
         (Mods::ALT, Key::Space, StageIntent::LabCycle),
     ];
+    // Alt and a number: the nth window, whatever extension it holds.
+    // A tiler needs somewhere to jump to, not only a way to step.
+    for (at, key) in DIGITS.into_iter().enumerate() {
+        out.push((Mods::ALT, key, StageIntent::Slot(at as u8)));
+    }
     match scope {
         ScopeContext::MidiLab => {
             out.extend([
@@ -2520,10 +2540,24 @@ fn lab_bindings(scope: ScopeContext) -> Vec<(Mods, Key, StageIntent)> {
                     StageIntent::MidiLabShift(Step::Right),
                 ),
                 (Mods::NONE, Key::Tab, StageIntent::MidiLabGroup),
+                (Mods::NONE, Key::A, StageIntent::MidiLadder),
             ]);
         }
         ScopeContext::Lab => {
             out.push((Mods::NONE, Key::Space, StageIntent::ToggleTransport));
+        }
+        // The extension menu: a short list, and the numbers beside it.
+        ScopeContext::LabMenu => {
+            // The transport belongs to no scope in particular, this one
+            // included: a menu must not be a place the song cannot stop.
+            out.push((Mods::NONE, Key::Space, StageIntent::ToggleTransport));
+            out.push((Mods::NONE, Key::ArrowUp, StageIntent::Step(Step::Up)));
+            out.push((Mods::NONE, Key::ArrowDown, StageIntent::Step(Step::Down)));
+            out.push((Mods::NONE, Key::K, StageIntent::Step(Step::Up)));
+            out.push((Mods::NONE, Key::J, StageIntent::Step(Step::Down)));
+            for (at, key) in DIGITS.into_iter().enumerate() {
+                out.push((Mods::NONE, key, StageIntent::Slot(at as u8)));
+            }
         }
         ScopeContext::Kiln => {
             out.push((Mods::NONE, Key::Tab, StageIntent::KilnBand));
@@ -2873,6 +2907,7 @@ fn family(intent: StageIntent) -> &'static str {
         | StageIntent::LabFull
         | StageIntent::LabResize(_)
         | StageIntent::LabSplit
+        | StageIntent::MidiLadder
         | StageIntent::LabCycle
         | StageIntent::KilnBand
         | StageIntent::KilnMacro(_)
@@ -3219,6 +3254,7 @@ mod tests {
                         | ScopeContext::Kiln
                         | ScopeContext::KilnFilter
                         | ScopeContext::MidiLab
+                        | ScopeContext::LabMenu
                 ))
                 .then_some(StageIntent::Page(page));
                 assert_eq!(

@@ -149,6 +149,7 @@ fn scope_word(scope: ScopeContext) -> &'static str {
         ScopeContext::Kiln => "KILN",
         ScopeContext::KilnFilter => "FILTER",
         ScopeContext::MidiLab => "MIDILAB",
+        ScopeContext::LabMenu => "KINDS",
     }
 }
 
