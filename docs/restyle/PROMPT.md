@@ -1,10 +1,23 @@
 # Restyle brief — glass rave console
 
-Reference image: [`workspace-session.png`](workspace-session.png) — the stage's
-session view at 1280×800, rendered headless by `shot`. Real pixels, not a drawing
-of them.
+**Reference image:**
+https://raw.githubusercontent.com/naiqvist/daw/ui-redesign/docs/restyle/workspace-session.png
 
-Direction: Apple's glass **readability**, none of its boardroom manners.
+---
+
+## What to do
+
+Open the reference image above. It is the current UI of a keyboard-driven music
+workstation. Produce a **restyled version of that same screen** — same layout,
+new material and palette — following the prompt below exactly.
+
+Return the result as a 1280×800 image, and a link that can be opened without an
+account.
+
+Do not redesign the layout. Every panel stays where it is. If the key row moves
+or the meter block is reshaped, the result is unusable and should be regenerated.
+
+---
 
 ## The prompt
 
@@ -52,6 +65,22 @@ Photoreal UI render, sharp, 1280x800, no mockup frame, no desktop behind it,
 no hands, no window chrome.
 ```
 
+---
+
+## What the screen contains, top to bottom
+
+So a generator knows what it is looking at:
+
+1. **Status bar** — scope, track/scene/pattern numbers, app version, song name.
+2. **Key row** — eight cells, F1 TRIG · F2 SRC · F3 FLTR · F4 AMP · F5 LFO ·
+   F6 FX · F7 MIX · F8, each with a small glyph. One is lit at a time.
+3. **Track heads** — a plate per track, number and name, across the field.
+4. **Scene grid** — rows of cells under the heads; a filled cell is a clip.
+5. **DESK block**, right — stereo meters for buses, returns and the mix, over a log.
+6. **Clip tray**, foot — the open clip's trig readout and its step grid.
+7. **Transport strip** — bar, bpm, meter, state, then rewind/stop/play/record/
+   forward, then engine readouts (rate, buf, load, xruns).
+
 ## What it starts from
 
 Measured off the reference at its own raster, not chosen.
@@ -74,13 +103,3 @@ Measured off the reference at its own raster, not chosen.
 | lattice row pitch | 28.4 |
 | clip tray | 182 |
 | transport strip | 45 |
-
-## Why the KEEP block is load-bearing
-
-Without it an image model redesigns the layout and returns a poster rather than
-something traceable. If the result comes back with the key row moved or the desk
-block reshaped, that is the failure mode — regenerate rather than work from it.
-
-When a result comes back, run `tools/trace.py auto` on it before building
-anything: it reports the palette, bands, cell geometry, borders and radii it
-actually contains, and whether the layout survived.
