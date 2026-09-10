@@ -124,7 +124,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // ---- egui: run the card and tessellate what it drew -------------
     //
-    // TWO passes, because egui settles layout on the second. Both frames'
+    // FOUR passes, not two. Two is what egui needs to settle layout, but
+    // the theme is watched rather than read: `palette::Skin` holds a
+    // `watch::Settle(3)`, which fires only after three consecutive
+    // identical fingerprints. At two passes it never fires, `colours()`
+    // falls back to `Colours::DEFAULT`, and every shot came out in the
+    // built-in teal no matter what `~/Corpus/daw.theme` said — which
+    // makes this harness useless for judging a skin. Three passes settle
+    // it; the fourth draws with the colours that just landed.
+    //
+    // Both early frames'
     // texture deltas are applied: the FIRST is the one carrying the font
     // atlas, and every egui mesh samples that atlas — even a solid fill
     // takes its colour from the atlas's white pixel. Drop it and the
@@ -134,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut jobs = Vec::new();
     let mut screen_regions = Vec::new();
     let key_frames = posed_key_frames(&which);
-    for pass in 0..(2 + key_frames.len()) {
+    for pass in 0..(4 + key_frames.len()) {
         // A pose named `-full` is shot as the app would look fullscreen:
         // the stage reads that from the viewport, exactly as it does in
         // the real shell, so the cut corners show.
