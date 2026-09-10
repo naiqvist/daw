@@ -24,8 +24,14 @@ use eframe::egui;
 
 /// The tray's height, cut off the foot of the field. Fixed, so the
 /// session above never changes shape when a clip opens or closes.
+///
+/// Traced to 182 off the macOS reference and put back: that drawing's
+/// tray holds a step grid and nothing else, while ours also carries the
+/// TRIG readout — four label/value pairs in two columns — which collapses
+/// into itself below about 230px. A number measured off a mockup is only
+/// right if the mockup's content is ours.
 /// @tune 120..480 px
-pub(super) const TRAY_H: f32 = 182.0;
+pub(super) const TRAY_H: f32 = 240.0;
 /// The widest the sequencer is drawn; past this the tray is left empty
 /// rather than stretched, so the grid keeps a size the eye has learned.
 /// @tune 400..1600 px

@@ -505,6 +505,67 @@ fn build_stage(which: &str) -> daw::ui::stage::Stage {
             .song_mut()
             .add_device(0, daw::devices::DeviceKind::Kit);
         let _ = stage.apply(StageIntent::Devices);
+    } else if which.contains("session4") {
+        // A REAL session: four furnished tracks, clips across the scenes,
+        // one of them playing, and the sequencer open on another. Every
+        // other stage pose is a default document with one empty track,
+        // which shows the chrome and none of the work — no use at all as
+        // a reference for what this app looks like while it is used.
+        use daw::sequencing::{Note, PATTERN_STEP_TICKS};
+        let voices: [(&str, daw::devices::DeviceKind, &[usize], u8); 4] = [
+            ("KICK", daw::devices::DeviceKind::Thump, &[0, 4, 8, 10, 12], 36),
+            ("BASS", daw::devices::DeviceKind::Acid, &[0, 3, 6, 9, 14], 40),
+            ("KEYS", daw::devices::DeviceKind::Glass, &[2, 6, 11], 60),
+            ("HAT", daw::devices::DeviceKind::Drum, &[0, 2, 4, 6, 8, 10, 12, 14], 54),
+        ];
+        for (track, (name, kind, hits, root)) in voices.iter().enumerate() {
+            if track > 0 {
+                let before = stage.song().tracks.len();
+                let _ = stage.apply(StageIntent::NewInstrumentTrack);
+                if stage.song().tracks.len() <= before {
+                    break;
+                }
+            }
+            stage.song_mut().rename_track(track, name);
+            let _ = stage.song_mut().add_device(track, *kind);
+            // Clips down the scenes, so the lattice reads as an
+            // arrangement rather than a single row of pads.
+            for scene in 0..(3 + track % 2) {
+                let Some(pattern) = stage.song_mut().fill_slot(track, scene) else {
+                    continue;
+                };
+                if scene > 0 {
+                    continue;
+                }
+                let Some(clip) = stage.song_mut().pattern_mut(pattern) else {
+                    continue;
+                };
+                clip.length_ticks = 16 * PATTERN_STEP_TICKS;
+                for (nth, &step) in hits.iter().enumerate() {
+                    let trig = clip.trig_mut(step);
+                    trig.enabled = true;
+                    trig.notes.push(Note::new(
+                        root + (nth as u8 % 3) * 5,
+                        PATTERN_STEP_TICKS,
+                        84 + (nth as u8 * 13) % 40,
+                    ));
+                    // One of each rule across the song, not all on one
+                    // trig: a condition, a retrig, a held probability.
+                    if track == 1 && nth == 2 {
+                        trig.cond = Some((3, 4));
+                    }
+                    if track == 3 && nth == 5 {
+                        trig.retrig = Some(daw::sequencing::Retrig::default());
+                    }
+                    if track == 2 && nth == 1 {
+                        trig.probability = 0.62;
+                    }
+                }
+            }
+        }
+        // Open the sequencer on the first track's clip, and roll.
+        let _ = stage.apply(StageIntent::Step(Step::Down));
+        let _ = stage.apply(StageIntent::Enter);
     } else if which.contains("deck") || which.contains("stage-steps") {
         use daw::pages::PageKey;
         use daw::sequencing::{Note, PATTERN_STEP_TICKS};
