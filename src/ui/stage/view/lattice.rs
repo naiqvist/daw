@@ -120,18 +120,17 @@ impl super::super::Stage {
                 // S07: three materials, not two-and-a-hole. A cell with
                 // nothing in it is still a PLACE a clip can go, so it
                 // gets the recessed lane; a clip sits raised on top of
-                // it. The mockups measure exactly this — field #302d29,
-                // resting cell #3c3735, clip block #897d70 — and the old
+                // it. The macOS square reference measures field #0a1a31,
+                // resting cell #19314b, clip cell #223c51 — and the old
                 // empty-means-no-fill left the columns as a hairline
                 // grid over bare ground.
                 //
-                // Every clip wears `chassis` for now. Per-lane hue is
-                // S19; until the lane kinds carry one, one warm tone
-                // beats four invented ones.
+                // A clip wears `edge`, the raised surface, one step
+                // above the lane it sits in. Per-lane hue is S19.
                 let pad = if selected || sounding {
                     c.select
                 } else if clip.is_some() {
-                    c.chassis
+                    c.edge
                 } else {
                     c.panel
                 };
@@ -157,13 +156,14 @@ impl super::super::Stage {
                             egui::Align2::LEFT_CENTER,
                             self.song.tag_of(id),
                             font.clone(),
-                            // A tag reads against the material under it:
-                            // bright on the dark selection ground, the
-                            // ground itself on a raised clip block.
+                            // A tag reads against the material under it.
+                            // Both grounds are dark under this palette,
+                            // so both take light ink; only the emphasis
+                            // differs.
                             if sounding || selected {
                                 c.bright
                             } else {
-                                c.ground
+                                c.fg
                             },
                         );
                     }

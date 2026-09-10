@@ -1,0 +1,25 @@
+# daw. name  L  C  h(radians), OkLCh. The same roles as tachikoma's.
+# Edited live by `cargo run -p palette-picker -- <this file>`.
+#
+# MACOS SQUARE, traced 2026-09-10 from
+# ui-mockups/older-explorations/session-macos-square-concept.png,
+# cropped to the app content and resampled to the app's 1280x800 raster.
+# Chosen over soft-pc98-earth on measured legibility: that palette held
+# fifteen of sixteen roles under C 0.06, so hue could no longer carry
+# type. Footer contrast 14.9:1 against 9.9:1, chroma spread 242 against 82.
+ground   0.218 0.050 -1.787   # #0a1a31  field, the darkest thing
+ink      0.945 0.017 -1.955   # #e4eef8  the colour you read in
+panel    0.307 0.056 -1.888   # #19314b  cells, clip pads
+bright   0.956 0.015 -2.063   # #e8f2fa  emphasis text
+fg       0.919 0.025 -1.921   # #d8e6f5  body text
+dim      0.674 0.051 -1.961   # #7e9ab5  subordinate text
+rule     0.468 0.050 -1.867   # #465c76  hairlines, meter tracks
+edge     0.396 0.054 -2.153   # #284b60  raised surfaces, headers, key cells
+chassis  0.788 0.117  1.073   # #f0a868  the focused edge
+select   0.324 0.051 -2.482   # #0d3a45  selection ground
+label    0.719 0.099 -2.684   # #4ab6c3  a field's name
+dir      0.714 0.103 -1.951   # #6da8e0  a thing's name, stronger
+nominal  0.855 0.191  2.785   # #1df4a2  sounding, in budget
+alert    0.703 0.141  0.901   # #e38344  threshold, playing now
+fault    0.670 0.169  0.159   # #e8617f  a defect
+drum     0.707 0.145 -1.120   # #a98cf0  the drum lane's hue
